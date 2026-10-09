@@ -1,0 +1,9 @@
+# camera program (you already have these)
+mediapipe
+opencv-contrib-python
+numpy
+# dashboard
+streamlit>=1.50
+pandas
+plotly
+tzdata        # needed on Windows for the Asia/Dhaka time zone
