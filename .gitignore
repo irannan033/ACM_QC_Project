@@ -1,0 +1,13 @@
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Generated test outputs
+test_annotated.mp4
+test_count.json
+test_events.csv
+test_events.db
+
+qc_demo.db
+qc_events.db
