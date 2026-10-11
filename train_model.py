@@ -754,6 +754,23 @@ def create_hand_mask(
     return complete_mask
 
 
+def create_tight_hand_mask(
+    frame_shape,
+    all_hand_points,
+    minimum_padding=2
+):
+    """
+    Small hand mask used ONLY to protect panel detection.
+    The full dilated mask is too large and erases fabric held in the hand.
+    """
+    return create_hand_mask(
+        frame_shape,
+        all_hand_points,
+        expansion_ratio=0.02,
+        minimum_padding=minimum_padding
+    )
+
+
 # ===========================================================================
 # Hand colour and motion tracking
 # ===========================================================================
@@ -965,19 +982,14 @@ class FrameMotionDetector:
 
 class PanelPresenceDetector:
     """
-    Detects a panel by comparing the current ROI with a calibrated
-    background image.
+    White-table panel detector (no background calibration).
 
-    Unlike frame-only motion detection, the panel remains detectable after
-    slowing down or stopping.
-
-    A separate moving flag is calculated from:
-
-    1. Short-term frame difference inside the panel region.
-    2. Movement of the detected panel centroid.
-
-    This prevents a previously checked stationary panel from being counted
-    again merely because a hand enters the checked area.
+    Rule:
+      - Table is always WHITE
+      - PANEL = fabric of ANY colour (dark, bright, pastel, patterned)
+        detected as non-white / colourful / darker than the table
+      - Hands are only lightly filtered so fabric colour is kept
+      - Count when a panel moves Bundle (AREA 1) -> Checked (AREA 2)
     """
 
     def __init__(
@@ -990,76 +1002,47 @@ class PanelPresenceDetector:
         minimum_dimension_ratio,
         minimum_hand_colour_ratio,
         panel_motion_ratio,
-        background_learning_rate
+        background_learning_rate,
+        white_l_min=175.0,
+        white_chroma_max=22.0,
     ):
         self.rectangle = rectangle
+        self.calibration_samples = max(3, int(calibration_samples))
+        # background_distance kept for CLI compatibility; maps to white sensitivity
+        self.background_distance = float(background_distance)
+        self.minimum_pixel_ratio = float(minimum_pixel_ratio)
+        self.minimum_span_ratio = float(minimum_span_ratio)
+        self.minimum_dimension_ratio = float(minimum_dimension_ratio)
+        self.minimum_hand_colour_ratio = float(minimum_hand_colour_ratio)
+        self.panel_motion_ratio = float(panel_motion_ratio)
+        self.background_learning_rate = float(background_learning_rate)
 
-        self.calibration_samples = max(
-            5,
-            int(calibration_samples)
-        )
+        # White table thresholds in OpenCV LAB (L,a,b all 0..255, neutral a/b = 128)
+        self.white_l_min = float(white_l_min)
+        self.white_chroma_max = float(white_chroma_max)
 
-        self.background_distance = float(
-            background_distance
-        )
-
-        self.minimum_pixel_ratio = float(
-            minimum_pixel_ratio
-        )
-
-        self.minimum_span_ratio = float(
-            minimum_span_ratio
-        )
-
-        self.minimum_dimension_ratio = float(
-            minimum_dimension_ratio
-        )
-
-        self.minimum_hand_colour_ratio = float(
-            minimum_hand_colour_ratio
-        )
-
-        self.panel_motion_ratio = float(
-            panel_motion_ratio
-        )
-
-        self.background_learning_rate = float(
-            background_learning_rate
-        )
-
-        self.background_lab = None
         self.samples_collected = 0
-
+        self._learned_l_min = None
         self.previous_centroid = None
         self.smoothed_centroid_motion = 0.0
 
     @property
     def calibrated(self):
-        return (
-            self.background_lab is not None
-            and self.samples_collected
-            >= self.calibration_samples
-        )
+        # White table: no background calibration required
+        return True
 
     @property
     def calibration_progress(self):
-        return min(
-            1.0,
-            self.samples_collected
-            / max(self.calibration_samples, 1)
-        )
+        return 1.0
 
     def reset_background(self):
-        self.background_lab = None
+        # Kept for B key compatibility; does not block detection
         self.samples_collected = 0
+        self._learned_l_min = None
         self.previous_centroid = None
         self.smoothed_centroid_motion = 0.0
 
-    def _empty_result(
-        self,
-        frame_shape,
-        status
-    ):
+    def _empty_result(self, frame_shape, status):
         return {
             "detected": False,
             "moving": False,
@@ -1068,39 +1051,20 @@ class PanelPresenceDetector:
             "pixel_ratio": 0.0,
             "span_ratio": 0.0,
             "motion_ratio": 0.0,
-            "hand_colour_ratio": 0.0,
+            "hand_colour_ratio": 1.0,
             "centroid_motion": 0.0,
-            "mask": np.zeros(
-                frame_shape[:2],
-                dtype=np.uint8
-            ),
-            "status": status
+            "mask": np.zeros(frame_shape[:2], dtype=np.uint8),
+            "status": status,
         }
 
-    def _add_calibration_sample(
-        self,
-        roi_lab
-    ):
-        current = roi_lab.astype(
-            np.float32
-        )
-
-        if self.background_lab is None:
-            self.background_lab = current.copy()
-            self.samples_collected = 1
-            return
-
-        alpha = 1.0 / (
-            self.samples_collected + 1
-        )
-
-        cv2.accumulateWeighted(
-            current,
-            self.background_lab,
-            alpha
-        )
-
-        self.samples_collected += 1
+    def _effective_white_l_min(self):
+        # Lower L min slightly if table is off-white / greyish under weak light
+        if self._learned_l_min is not None:
+            return float(self._learned_l_min)
+        # background_distance CLI: higher = stricter white (need brighter)
+        # map typical 8..16 -> small adjustment
+        adj = max(0.0, (16.0 - self.background_distance) * 1.5)
+        return max(130.0, self.white_l_min - adj)
 
     def update(
         self,
@@ -1111,392 +1075,123 @@ class PanelPresenceDetector:
         hand_near_area
     ):
         frame_height, frame_width = lab_frame.shape[:2]
-
         x, y, width, height = self.rectangle
 
         x1 = max(0, x)
         y1 = max(0, y)
-
-        x2 = min(
-            frame_width,
-            x + width
-        )
-
-        y2 = min(
-            frame_height,
-            y + height
-        )
-
+        x2 = min(frame_width, x + width)
+        y2 = min(frame_height, y + height)
         roi_width = x2 - x1
         roi_height = y2 - y1
 
         if roi_width <= 2 or roi_height <= 2:
-            return self._empty_result(
-                lab_frame.shape,
-                "INVALID ROI"
-            )
+            return self._empty_result(lab_frame.shape, "INVALID ROI")
 
-        roi_lab = lab_frame[
-            y1:y2,
-            x1:x2
-        ]
+        roi_lab = lab_frame[y1:y2, x1:x2]
+        roi_hand = hand_mask[y1:y2, x1:x2]
+        roi_motion = frame_motion_mask[y1:y2, x1:x2]
 
-        roi_hand_mask = hand_mask[
-            y1:y2,
-            x1:x2
-        ]
+        L = roi_lab[:, :, 0].astype(np.float32)
+        A = roi_lab[:, :, 1].astype(np.float32)
+        B = roi_lab[:, :, 2].astype(np.float32)
+        chroma = np.sqrt((A - 128.0) ** 2 + (B - 128.0) ** 2)
 
-        roi_motion_mask = frame_motion_mask[
-            y1:y2,
-            x1:x2
-        ]
+        white_l = self._effective_white_l_min()
 
-        if not self.calibrated:
-            # Do not include a visible hand in the background model.
-            if not hand_near_area:
-                self._add_calibration_sample(
-                    roi_lab
-                )
+        # WHITE table = bright + low colour (near grey/white only)
+        is_white = (L >= white_l) & (chroma <= self.white_chroma_max)
 
-            return self._empty_result(
-                lab_frame.shape,
-                (
-                    "CALIBRATING "
-                    f"{int(self.calibration_progress * 100)}%"
-                )
-            )
+        # PANEL = any different colour fabric on the white table:
+        #   - dark fabric (black, navy, grey)  -> low L
+        #   - bright / dyed fabric            -> high chroma (any hue)
+        #   - pastel fabric                   -> moderate chroma or mid L not pure white
+        #   - light coloured fabric           -> fails strict white test
+        is_dark = L < (white_l - 25.0)
+        is_colourful = chroma >= max(12.0, self.white_chroma_max * 0.45)
+        is_not_white = ~is_white
 
-        current_lab = roi_lab.astype(
-            np.float32
-        )
+        is_panel = is_not_white | is_dark | is_colourful
+        panel_mask = is_panel.astype(np.uint8) * 255
 
-        difference = (
-            current_lab
-            - self.background_lab
-        )
+        # Remove only tight skin-like hand pixels (keep coloured fabric)
+        if cv2.countNonZero(roi_hand) > 0:
+            if hand_reference_lab is not None:
+                hand_diff = roi_lab.astype(np.float32) - hand_reference_lab.reshape(1, 1, 3)
+                hand_dist = np.sqrt(np.sum(hand_diff * hand_diff, axis=2))
+                skin = (hand_dist < 25.0).astype(np.uint8) * 255
+                suppress = cv2.bitwise_and(roi_hand, skin)
+                k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+                suppress = cv2.erode(suppress, k, iterations=1)
+                panel_mask = cv2.bitwise_and(panel_mask, cv2.bitwise_not(suppress))
+            else:
+                k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                tight = cv2.erode(roi_hand, k, iterations=2)
+                panel_mask = cv2.bitwise_and(panel_mask, cv2.bitwise_not(tight))
 
-        # Approximate LAB colour distance.
-        lightness_difference = (
-            difference[:, :, 0] * 0.65
-        )
+        # Clean mask
+        k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        k7 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        panel_mask = cv2.morphologyEx(panel_mask, cv2.MORPH_OPEN, k3)
+        panel_mask = cv2.morphologyEx(panel_mask, cv2.MORPH_CLOSE, k7)
+        panel_mask = cv2.dilate(panel_mask, k3, iterations=1)
 
-        colour_a_difference = (
-            difference[:, :, 1]
-        )
-
-        colour_b_difference = (
-            difference[:, :, 2]
-        )
-
-        background_distance = np.sqrt(
-            lightness_difference
-            * lightness_difference
-            + colour_a_difference
-            * colour_a_difference
-            + colour_b_difference
-            * colour_b_difference
-        )
-
-        appearance_mask = np.where(
-            background_distance
-            >= self.background_distance,
-            255,
-            0
-        ).astype(np.uint8)
-
-        # Remove only the actual hand region. Panel pixels around the hand
-        # remain available to the detector.
-        inverse_hand_mask = cv2.bitwise_not(
-            roi_hand_mask
-        )
-
-        candidate_mask = cv2.bitwise_and(
-            appearance_mask,
-            inverse_hand_mask
-        )
-
-        opening_kernel = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE,
-            (3, 3)
-        )
-
-        close_size = int(
-            min(
-                19,
-                max(
-                    5,
-                    min(roi_width, roi_height)
-                    * 0.025
-                )
-            )
-        )
-
-        if close_size % 2 == 0:
-            close_size += 1
-
-        closing_kernel = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE,
-            (close_size, close_size)
-        )
-
-        candidate_mask = cv2.morphologyEx(
-            candidate_mask,
-            cv2.MORPH_OPEN,
-            opening_kernel
-        )
-
-        candidate_mask = cv2.morphologyEx(
-            candidate_mask,
-            cv2.MORPH_CLOSE,
-            closing_kernel
-        )
-
-        candidate_mask = cv2.dilate(
-            candidate_mask,
-            opening_kernel,
-            iterations=1
-        )
-
-        roi_area = max(
-            1,
-            roi_width * roi_height
-        )
-
-        minimum_component_area = max(
-            12,
-            int(roi_area * 0.00015)
-        )
-
-        number_of_labels, labels, statistics, _ = (
-            cv2.connectedComponentsWithStats(
-                candidate_mask,
-                connectivity=8
-            )
-        )
-
-        valid_components = []
-
-        for label in range(1, number_of_labels):
-            component_area = int(
-                statistics[
-                    label,
-                    cv2.CC_STAT_AREA
-                ]
-            )
-
-            if component_area >= minimum_component_area:
-                valid_components.append(
-                    (component_area, label)
-                )
-
-        valid_components.sort(
-            reverse=True
-        )
-
-        aggregate_mask = np.zeros_like(
-            candidate_mask
-        )
-
-        # A panel often appears as several separated changed regions.
-        for _, label in valid_components[:10]:
-            aggregate_mask[
-                labels == label
-            ] = 255
-
-        pixel_area = int(
-            cv2.countNonZero(
-                aggregate_mask
-            )
-        )
+        roi_area = max(1, roi_width * roi_height)
+        pixel_area = int(cv2.countNonZero(panel_mask))
 
         if pixel_area <= 0:
             self.previous_centroid = None
-            self.smoothed_centroid_motion *= 0.60
+            self.smoothed_centroid_motion *= 0.6
+            return self._empty_result(lab_frame.shape, "NO PANEL")
 
-            # Slowly adapt to ordinary background/lighting changes.
-            if not hand_near_area:
-                cv2.accumulateWeighted(
-                    current_lab,
-                    self.background_lab,
-                    self.background_learning_rate
-                )
+        pts = cv2.findNonZero(panel_mask)
+        bx, by, bw, bh = cv2.boundingRect(pts)
+        span_area = bw * bh
+        pixel_ratio = pixel_area / roi_area
+        span_ratio = span_area / roi_area
+        width_ratio = bw / max(roi_width, 1)
+        height_ratio = bh / max(roi_height, 1)
 
-            return self._empty_result(
-                lab_frame.shape,
-                "NO PANEL"
-            )
-
-        nonzero_points = cv2.findNonZero(
-            aggregate_mask
-        )
-
-        (
-            component_x,
-            component_y,
-            component_width,
-            component_height
-        ) = cv2.boundingRect(
-            nonzero_points
-        )
-
-        span_area = (
-            component_width
-            * component_height
-        )
-
-        pixel_ratio = (
-            pixel_area / roi_area
-        )
-
-        span_ratio = (
-            span_area / roi_area
-        )
-
-        width_ratio = (
-            component_width / roi_width
-        )
-
-        height_ratio = (
-            component_height / roi_height
-        )
-
-        moments = cv2.moments(
-            aggregate_mask,
-            binaryImage=True
-        )
-
+        moments = cv2.moments(panel_mask, binaryImage=True)
         if moments["m00"] > 0:
-            centroid = (
-                moments["m10"] / moments["m00"],
-                moments["m01"] / moments["m00"]
-            )
+            centroid = (moments["m10"] / moments["m00"], moments["m01"] / moments["m00"])
         else:
-            centroid = (
-                component_x + component_width / 2.0,
-                component_y + component_height / 2.0
-            )
+            centroid = (bx + bw / 2.0, by + bh / 2.0)
 
         if self.previous_centroid is None:
             centroid_motion = 0.0
         else:
             centroid_motion = math.hypot(
-                centroid[0]
-                - self.previous_centroid[0],
-                centroid[1]
-                - self.previous_centroid[1]
+                centroid[0] - self.previous_centroid[0],
+                centroid[1] - self.previous_centroid[1],
             )
-
         self.previous_centroid = centroid
-
         self.smoothed_centroid_motion = (
-            0.65 * self.smoothed_centroid_motion
-            + 0.35 * centroid_motion
+            0.65 * self.smoothed_centroid_motion + 0.35 * centroid_motion
         )
 
-        moving_intersection = cv2.bitwise_and(
-            aggregate_mask,
-            roi_motion_mask
-        )
+        moving_pixels = int(cv2.countNonZero(cv2.bitwise_and(panel_mask, roi_motion)))
+        motion_ratio = moving_pixels / roi_area
 
-        moving_pixels = int(
-            cv2.countNonZero(
-                moving_intersection
-            )
-        )
-
-        motion_ratio = (
-            moving_pixels / roi_area
-        )
-
-        # Determine how much of the candidate differs from hand colour.
-        if hand_reference_lab is None:
-            hand_colour_ratio = 1.0
-        else:
-            hand_difference = (
-                current_lab
-                - hand_reference_lab.reshape(
-                    1,
-                    1,
-                    3
-                )
-            )
-
-            hand_colour_distance = np.sqrt(
-                np.sum(
-                    hand_difference
-                    * hand_difference,
-                    axis=2
-                )
-            )
-
-            different_from_hand = np.where(
-                hand_colour_distance >= 18.0,
-                255,
-                0
-            ).astype(np.uint8)
-
-            different_panel_pixels = cv2.countNonZero(
-                cv2.bitwise_and(
-                    aggregate_mask,
-                    different_from_hand
-                )
-            )
-
-            hand_colour_ratio = (
-                different_panel_pixels
-                / max(pixel_area, 1)
-            )
-
-        dimension_large_enough = (
-            width_ratio
-            >= self.minimum_dimension_ratio
-            or height_ratio
-            >= self.minimum_dimension_ratio
+        dimension_ok = (
+            width_ratio >= self.minimum_dimension_ratio
+            or height_ratio >= self.minimum_dimension_ratio
         )
 
         raw_detected = (
-            pixel_ratio
-            >= self.minimum_pixel_ratio
-            and span_ratio
-            >= self.minimum_span_ratio
-            and dimension_large_enough
-            and hand_colour_ratio
-            >= self.minimum_hand_colour_ratio
-            and pixel_ratio < 0.92
+            pixel_ratio >= self.minimum_pixel_ratio
+            and span_ratio >= self.minimum_span_ratio
+            and dimension_ok
+            and pixel_ratio < 0.98
         )
 
-        centroid_motion_threshold = max(
-            0.75,
-            min(roi_width, roi_height) * 0.0025
+        centroid_thr = max(0.75, min(roi_width, roi_height) * 0.0025)
+        panel_is_moving = raw_detected and (
+            motion_ratio >= self.panel_motion_ratio
+            or self.smoothed_centroid_motion >= centroid_thr
         )
 
-        panel_is_moving = (
-            raw_detected
-            and (
-                motion_ratio
-                >= self.panel_motion_ratio
-                or self.smoothed_centroid_motion
-                >= centroid_motion_threshold
-            )
-        )
-
-        global_mask = np.zeros(
-            (frame_height, frame_width),
-            dtype=np.uint8
-        )
-
-        global_mask[
-            y1:y2,
-            x1:x2
-        ] = aggregate_mask
-
-        # Update the background only when no panel and no hand is present.
-        if not raw_detected and not hand_near_area:
-            cv2.accumulateWeighted(
-                current_lab,
-                self.background_lab,
-                self.background_learning_rate
-            )
+        global_mask = np.zeros((frame_height, frame_width), dtype=np.uint8)
+        global_mask[y1:y2, x1:x2] = panel_mask
 
         return {
             "detected": raw_detected,
@@ -1506,31 +1201,32 @@ class PanelPresenceDetector:
             "pixel_ratio": pixel_ratio,
             "span_ratio": span_ratio,
             "motion_ratio": motion_ratio,
-            "hand_colour_ratio": hand_colour_ratio,
-            "centroid_motion": (
-                self.smoothed_centroid_motion
-            ),
+            "hand_colour_ratio": 1.0,
+            "centroid_motion": self.smoothed_centroid_motion,
             "mask": global_mask,
             "status": (
                 "MOVING PANEL"
                 if panel_is_moving
-                else (
-                    "PANEL PRESENT"
-                    if raw_detected
-                    else "BACKGROUND CHANGE"
-                )
-            )
+                else ("PANEL PRESENT" if raw_detected else "BACKGROUND CHANGE")
+            ),
         }
 
 
-# ===========================================================================
-# Workflow state machine
-# ===========================================================================
-
 class TransferCounter:
-    WAIT_SOURCE = "WAITING FOR PANEL IN BUNDLE"
-    ARMED = "BUNDLE COUNT 1 - MOVE TO CHECKED"
-    WAIT_RETURN = "CHECKED COUNT 1 - WAITING FOR RETURN"
+    """
+    Count when a coloured panel moves Bundle (AREA 1) -> Checked (AREA 2).
+
+    Edge-triggered (works when both areas keep showing MOVING PANEL):
+      WAIT_SOURCE : rising edge of bundle motion  -> ARMED
+      ARMED       : rising edge of checked motion -> COUNT +1
+      Then short cooldown, ready for the next panel.
+
+    Does not require the panel to fully disappear or the operator to hold still.
+    """
+
+    WAIT_SOURCE = "WAITING: PANEL MOVE IN BUNDLE"
+    ARMED = "ARMED: MOVE PANEL TO CHECKED"
+    COOLDOWN = "COUNTED: COOLDOWN"
 
     def __init__(
         self,
@@ -1538,51 +1234,40 @@ class TransferCounter:
         source_confirmation,
         checked_confirmation,
         return_confirmation,
-        transfer_timeout
+        transfer_timeout,
+        count_cooldown=2.5,
+        clear_seconds=0.5,
     ):
         self.count = starting_count
-
         self.bundle_stage_count = 0
         self.checked_stage_count = 0
 
-        self.source_confirmation = (
-            source_confirmation
-        )
-
-        self.checked_confirmation = (
-            checked_confirmation
-        )
-
-        self.return_confirmation = (
-            return_confirmation
-        )
-
-        self.transfer_timeout = (
-            transfer_timeout
-        )
+        self.source_confirmation = float(source_confirmation)
+        self.checked_confirmation = float(checked_confirmation)
+        self.return_confirmation = float(return_confirmation)
+        self.transfer_timeout = float(transfer_timeout)
+        self.count_cooldown = float(count_cooldown)
+        self.clear_seconds = float(clear_seconds)
 
         self.state = self.WAIT_SOURCE
         self.evidence_time = 0.0
         self.armed_time = None
+        self.last_count_time = None
+
+        # Edge detection: previous frame motion flags
+        self._prev_work_moving = False
+        self._prev_checked_moving = False
 
     def reset_evidence(self):
         self.evidence_time = 0.0
 
-    def update_evidence(
-        self,
-        condition,
-        delta_time,
-        decrease_rate=1.5
-    ):
+    def update_evidence(self, condition, delta_time, decrease_rate=1.5):
         if condition:
             self.evidence_time += delta_time
         else:
             self.evidence_time = max(
-                0.0,
-                self.evidence_time
-                - delta_time * decrease_rate
+                0.0, self.evidence_time - delta_time * decrease_rate
             )
-
         return self.evidence_time
 
     def reset_workflow(self):
@@ -1591,9 +1276,12 @@ class TransferCounter:
         self.checked_stage_count = 0
         self.armed_time = None
         self.reset_evidence()
+        self._prev_work_moving = False
+        self._prev_checked_moving = False
 
     def reset_all_counts(self):
         self.count = 0
+        self.last_count_time = None
         self.reset_workflow()
 
     def update(
@@ -1611,84 +1299,78 @@ class TransferCounter:
     ):
         event = None
 
-        # Panel presence + panel motion prevents noise from arming the
-        # workflow. Hand motion confirms that a worker is carrying it.
-        source_signal = (
-            hand_count >= 1
-            and hand_is_moving
-            and hand_in_work_area
-            and work_panel_detected
-            and work_panel_moving
-        )
+        work_moving = bool(work_panel_detected and work_panel_moving)
+        checked_moving = bool(checked_panel_detected and checked_panel_moving)
 
-        checked_signal = (
-            hand_count >= 1
-            and hand_is_moving
-            and hand_in_checked_area
-            and checked_panel_detected
-            and checked_panel_moving
-        )
+        # Rising edges: motion starts in that box
+        work_rise = work_moving and not self._prev_work_moving
+        checked_rise = checked_moving and not self._prev_checked_moving
 
         if self.state == self.WAIT_SOURCE:
-            evidence = self.update_evidence(
-                source_signal,
-                delta_time
-            )
+            # Arm when panel motion starts (or continues briefly) in bundle
+            if work_rise:
+                self.evidence_time = max(self.evidence_time, 0.0)
+            evidence = self.update_evidence(work_moving, delta_time)
 
-            if evidence >= self.source_confirmation:
-                self.state = self.ARMED
-                self.bundle_stage_count = 1
-                self.checked_stage_count = 0
-                self.armed_time = current_time
-                self.reset_evidence()
-                event = "BUNDLE_ACCEPTED"
+            if work_rise or evidence >= self.source_confirmation:
+                if work_moving:
+                    self.state = self.ARMED
+                    self.bundle_stage_count = 1
+                    self.checked_stage_count = 0
+                    self.armed_time = current_time
+                    self.reset_evidence()
+                    # Ignore checked edge on same frame as arm
+                    self._prev_checked_moving = checked_moving
+                    event = "BUNDLE_ACCEPTED"
 
         elif self.state == self.ARMED:
             if (
                 self.armed_time is not None
-                and current_time - self.armed_time
-                > self.transfer_timeout
+                and (current_time - self.armed_time) > self.transfer_timeout
             ):
                 self.reset_workflow()
                 event = "TIMEOUT"
-
             else:
-                evidence = self.update_evidence(
-                    checked_signal,
-                    delta_time
+                # Count on rising edge of motion in CHECKED after armed
+                # Also allow sustained checked motion shortly after arm (fast transfer)
+                evidence = self.update_evidence(checked_moving, delta_time)
+
+                trigger = checked_rise or (
+                    checked_moving and evidence >= self.checked_confirmation
                 )
 
-                if evidence >= self.checked_confirmation:
-                    self.bundle_stage_count = 0
-                    self.checked_stage_count = 1
-                    self.count += 1
+                if trigger:
+                    cooldown_ok = (
+                        self.last_count_time is None
+                        or (current_time - self.last_count_time)
+                        >= self.count_cooldown
+                    )
+                    if cooldown_ok:
+                        self.bundle_stage_count = 0
+                        self.checked_stage_count = 1
+                        self.count += 1
+                        self.last_count_time = current_time
+                        self.state = self.COOLDOWN
+                        self.armed_time = None
+                        self.reset_evidence()
+                        event = "CHECKED_COUNTED"
+                    else:
+                        self.reset_evidence()
 
-                    self.state = self.WAIT_RETURN
-                    self.armed_time = None
-                    self.reset_evidence()
-
-                    event = "CHECKED_COUNTED"
-
-        elif self.state == self.WAIT_RETURN:
-            returned_to_source = (
-                hand_count >= 1
-                and hand_in_work_area
-                and not hand_in_checked_area
-            )
-
-            evidence = self.update_evidence(
-                returned_to_source,
-                delta_time,
-                decrease_rate=1.0
-            )
-
-            if evidence >= self.return_confirmation:
+        elif self.state == self.COOLDOWN:
+            # Fixed cooldown then ready for next panel — do not wait for settle
+            if (
+                self.last_count_time is not None
+                and (current_time - self.last_count_time) >= self.count_cooldown
+            ):
                 self.bundle_stage_count = 0
                 self.checked_stage_count = 0
                 self.state = self.WAIT_SOURCE
                 self.reset_evidence()
-
                 event = "RETURNED_TO_BUNDLE"
+
+        self._prev_work_moving = work_moving
+        self._prev_checked_moving = checked_moving
 
         return event
 
@@ -2512,37 +2194,42 @@ def main():
     parser.add_argument(
         "--panel-background-distance",
         type=float,
-        default=16.0
+        default=10.0,
+        help="White-table sensitivity (lower = treat dimmer pixels as non-white panel)"
     )
 
     parser.add_argument(
         "--panel-pixel-ratio",
         type=float,
-        default=0.006
+        default=0.01,
+        help="Min fraction of ROI that must be coloured fabric (any colour)"
     )
 
     parser.add_argument(
         "--panel-span-ratio",
         type=float,
-        default=0.030
+        default=0.04,
+        help="Min bounding-box area of coloured panel / ROI"
     )
 
     parser.add_argument(
         "--panel-dimension-ratio",
         type=float,
-        default=0.15
+        default=0.12,
+        help="Min width or height of panel blob relative to ROI"
     )
 
     parser.add_argument(
         "--panel-hand-colour-ratio",
         type=float,
-        default=0.10
+        default=0.04,
+        help="Min share of panel pixels that are NOT hand-coloured (low = allow skin-tone fabric)"
     )
 
     parser.add_argument(
         "--panel-motion-ratio",
         type=float,
-        default=0.00045
+        default=0.00030
     )
 
     parser.add_argument(
@@ -2561,19 +2248,29 @@ def main():
     parser.add_argument(
         "--source-confirm-seconds",
         type=float,
-        default=0.10
+        default=0.08,
+        help="Seconds of moving panel in BUNDLE before arming (fast continuous OK)"
     )
 
     parser.add_argument(
         "--checked-confirm-seconds",
         type=float,
-        default=0.10
+        default=0.10,
+        help="Seconds of moving panel in CHECKED before count +1"
     )
 
     parser.add_argument(
         "--return-confirm-seconds",
         type=float,
-        default=0.14
+        default=0.12,
+        help="Seconds before next panel cycle (continuous checking)"
+    )
+
+    parser.add_argument(
+        "--count-cooldown",
+        type=float,
+        default=0.65,
+        help="Min seconds between counts (continuous checking)"
     )
 
     parser.add_argument(
@@ -2637,6 +2334,10 @@ def main():
     display_height, display_width = (
         first_frame.shape[:2]
     )
+
+    # Lock size from the first frame. Some files report or decode
+    # later frames at a different size; force every frame to match.
+    target_size = (display_width, display_height)
 
     reported_camera_fps = capture.get(
         cv2.CAP_PROP_FPS
@@ -2928,7 +2629,10 @@ def main():
         ),
         transfer_timeout=(
             args.transfer_timeout
-        )
+        ),
+        count_cooldown=(
+            args.count_cooldown
+        ),
     )
 
     popup = PopupNotification()
@@ -2986,8 +2690,8 @@ def main():
         )
 
     print("\nApplication started.")
-    print("Keep both areas clear during calibration.")
-    print("B = recalibrate backgrounds")
+    print("White table mode: no background calibration.")
+    print("B = reset motion state")
     print("M = debug masks")
     print("C = reset all counts")
     print("R = reset workflow")
@@ -3008,12 +2712,27 @@ def main():
                     success, frame = capture.read()
 
                     if not success or frame is None:
+                        print(
+                            "\nEnd of video (played once). "
+                            f"Frames processed: {frame_number}"
+                        )
                         break
 
                     frame = correct_camera_orientation(
                         frame,
                         is_camera,
                         args.unmirror_camera
+                    )
+
+                # Keep every frame the same size as the first frame
+                if (
+                    frame.shape[1] != target_size[0]
+                    or frame.shape[0] != target_size[1]
+                ):
+                    frame = cv2.resize(
+                        frame,
+                        target_size,
+                        interpolation=cv2.INTER_LINEAR
                     )
 
                 if is_camera:
@@ -3186,6 +2905,13 @@ def main():
                     args.hand_minimum_padding
                 )
 
+                # Tight mask for panel detection only (does not erase fabric)
+                panel_hand_mask = create_tight_hand_mask(
+                    process_frame.shape,
+                    cached_hand_points,
+                    minimum_padding=2
+                )
+
                 hand_reference_lab = (
                     hand_colour_tracker.update(
                         lab_frame,
@@ -3219,7 +2945,7 @@ def main():
                         frame_motion_mask=(
                             frame_motion_mask
                         ),
-                        hand_mask=hand_mask,
+                        hand_mask=panel_hand_mask,
                         hand_reference_lab=(
                             hand_reference_lab
                         ),
@@ -3235,7 +2961,7 @@ def main():
                         frame_motion_mask=(
                             frame_motion_mask
                         ),
-                        hand_mask=hand_mask,
+                        hand_mask=panel_hand_mask,
                         hand_reference_lab=(
                             hand_reference_lab
                         ),
@@ -3514,7 +3240,17 @@ def main():
                             debug_view
                         )
 
-                    key = cv2.waitKey(1) & 0xFF
+                    # For video files, pace close to real-time so it plays
+                    # once at normal speed (not double-speed / not looping).
+                    if is_camera:
+                        wait_ms = 1
+                    else:
+                        # Aim for source FPS; at least 1 ms
+                        wait_ms = max(
+                            1,
+                            int(round(1000.0 / max(reported_camera_fps, 1.0)))
+                        )
+                    key = cv2.waitKey(wait_ms) & 0xFF
 
                     if key == ord("q"):
                         running = False
